@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import webbrowser
 
-from textual import work
+from textual import events, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Center, Horizontal, Vertical
@@ -18,14 +18,13 @@ from textual.widgets import (
     DataTable,
     Footer,
     Input,
-    Label,
-    ListItem,
-    ListView,
     LoadingIndicator,
+    OptionList,
     RichLog,
     Static,
     TextArea,
 )
+from textual.widgets._option_list import Option
 from rich.text import Text
 
 from .models import Repo, SearchResult, SearchPlan, repos_sorted
@@ -84,23 +83,43 @@ def _repo_detail_markup(repo: Repo) -> str:
     return "\n".join(lines)
 
 
+_SLASH_COMMANDS: tuple[str, ...] = (
+    "/history",
+    "/clear-history",
+    "/help",
+    "/quit",
+)
+
+_SLASH_KEYS = ("up", "down", "enter", "escape", "tab")
+
+
+class SlashTextArea(TextArea):
+    async def _on_key(self, event: events.Key) -> None:
+        screen = self.screen
+        forward = getattr(screen, "handle_slash_key", None)
+        if (
+            event.key in _SLASH_KEYS
+            and callable(forward)
+            and forward(event.key) is True
+        ):
+            event.stop()
+            event.prevent_default()
+            return
+        await super()._on_key(event)
+
+
 class InputScreen(Screen):
     BINDINGS = [
         Binding("ctrl+enter", "submit", "开始搜索"),
         Binding("/", "focus_idea", "聚焦输入"),
-        Binding("h", "focus_history", "历史"),
-        Binding("v", "view_history", "回看"),
-        Binding("d", "delete_history", "删除"),
-        Binding("c", "clear_history", "清空"),
     ]
 
     def __init__(self) -> None:
         super().__init__()
         self._idea = ""
         self._language_filter = ""
-        self._history_entries: list[HistoryEntry] = []
-        self._idea_by_item: dict[ListItem, str] = {}
-        self._entry_by_item: dict[ListItem, HistoryEntry] = {}
+        self._slash_items: list[tuple[str, object]] = []
+        self._slash_visible = False
 
     def compose(self) -> ComposeResult:
         with Vertical(id="input-scroll"):
@@ -112,7 +131,7 @@ class InputScreen(Screen):
             with Center():
                 with Vertical(id="input-card"):
                     yield Static("你的想法", classes="field-label")
-                    yield TextArea(
+                    yield SlashTextArea(
                         self._idea,
                         id="idea-input",
                         placeholder="例如：自托管的个人知识库 + AI 问答",
@@ -124,18 +143,15 @@ class InputScreen(Screen):
                         placeholder="留空则不过滤",
                     )
                     yield Button("🔍 开始搜索", id="submit-btn", variant="primary")
-            yield Static("提示：ctrl+enter 或点击按钮开始搜索", id="hint")
-            with Center():
-                yield Static("历史搜索", id="history-label", classes="field-label")
-            with Center():
-                history_list = ListView(id="history-list")
-                history_list.styles.display = "none"
-                yield history_list
+                    slash_options = OptionList(id="slash-options")
+                    slash_options.styles.display = "none"
+                    yield slash_options
+            yield Static("提示：ctrl+enter 或点击按钮开始搜索，或输入 / 查看命令", id="hint")
         yield Footer()
 
     def on_mount(self) -> None:
         self.call_after_refresh(self.apply_values)
-        self.call_after_refresh(self._apply_history)
+        self.call_after_refresh(self.action_focus_idea)
 
     def set_values(self, idea: str, language_filter: str | None = None) -> None:
         self._idea = idea
@@ -148,33 +164,6 @@ class InputScreen(Screen):
         self.query_one("#idea-input", TextArea).text = self._idea
         self.query_one("#lang-input", Input).value = self._language_filter
 
-    def set_history(self, entries: list[HistoryEntry]) -> None:
-        self._history_entries = list(entries)
-        self._apply_history()
-
-    def _apply_history(self) -> None:
-        if not self.is_mounted:
-            return
-        list_view = self.query_one("#history-list", ListView)
-        list_view.clear()
-        self._idea_by_item = {}
-        self._entry_by_item = {}
-        for entry in self._history_entries:
-            item = ListItem(Label(self._history_label(entry)))
-            self._idea_by_item[item] = entry.result.idea
-            self._entry_by_item[item] = entry
-            list_view.append(item)
-        visible = "block" if self._history_entries else "none"
-        list_view.styles.display = visible
-        self.query_one("#history-label", Static).styles.display = visible
-
-    def _history_label(self, entry: HistoryEntry) -> str:
-        timestamp = entry.timestamp[5:16].replace("T", " ")
-        idea = entry.result.idea
-        if len(idea) > 60:
-            idea = idea[:57] + "…"
-        return f"{timestamp}  {idea}"
-
     def _gather(self) -> tuple[str, str | None]:
         idea = self.query_one("#idea-input", TextArea).text.strip()
         lang = self.query_one("#lang-input", Input).value.strip() or None
@@ -182,57 +171,107 @@ class InputScreen(Screen):
 
     def action_submit(self) -> None:
         idea, lang = self._gather()
-        if idea:
-            self.app.start_search(idea, lang)  # type: ignore[attr-defined]
+        if not idea:
+            return
+        if idea.startswith("/"):
+            token = idea.split()[0]
+            if token in _SLASH_COMMANDS:
+                self._run_slash(token)
+            else:
+                self.app.notify(f"未知命令: {token}")  # type: ignore[attr-defined]
+            return
+        self.app.start_search(idea, lang)  # type: ignore[attr-defined]
 
     def action_focus_idea(self) -> None:
         self.query_one("#idea-input", TextArea).focus()
 
-    def action_focus_history(self) -> None:
-        if self._history_entries:
-            list_view = self.query_one("#history-list", ListView)
-            list_view.index = 0
-            list_view.focus()
-
-    def _selected_entry(self) -> HistoryEntry | None:
-        list_view = self.query_one("#history-list", ListView)
-        item = list_view.highlighted_child
-        if item is None:
-            return None
-        return self._entry_by_item.get(item)
-
-    def action_view_history(self) -> None:
-        entry = self._selected_entry()
-        if entry is None:
-            return
-        self.app._results_screen.set_result(entry.result)  # type: ignore[attr-defined]
-        self.app.switch_screen("results")  # type: ignore[attr-defined]
-
-    def action_delete_history(self) -> None:
-        entry = self._selected_entry()
-        if entry is None:
-            return
-        self.app._history_store.delete(entry.id)  # type: ignore[attr-defined]
-        self.app._refresh_history_input()  # type: ignore[attr-defined]
-        if self._history_entries:
-            list_view = self.query_one("#history-list", ListView)
-            list_view.index = 0
-            list_view.focus()
-        else:
-            self.query_one("#idea-input", TextArea).focus()
-
-    def action_clear_history(self) -> None:
-        self.app._history_store.clear()  # type: ignore[attr-defined]
-        self.app._refresh_history_input()  # type: ignore[attr-defined]
-        self.query_one("#idea-input", TextArea).focus()
-
-    def on_list_view_selected(self, event: ListView.Selected) -> None:
-        idea = self._idea_by_item.get(event.item)
-        if idea is None:
-            return
-        self._idea = idea
+    def _run_slash(self, name: str) -> None:
+        app = self.app  # type: ignore[attr-defined]
+        self._idea = ""
         self.apply_values()
-        self.query_one("#idea-input", TextArea).focus()
+        self._hide_slash()
+        if name == "/history":
+            app.push_screen(HistoryScreen())
+        elif name == "/clear-history":
+            app._history_store.clear()
+            app.notify("历史已清空")
+            self.query_one("#idea-input", TextArea).focus()
+        elif name == "/help":
+            app.notify("/history /clear-history /help /quit")
+        elif name == "/quit":
+            app.exit()
+
+    def _refresh_slash(self, needle: str) -> None:
+        if not self.is_mounted:
+            return
+        items: list[tuple[str, object]] = []
+        prompts: list[Option] = []
+        for name in _SLASH_COMMANDS:
+            if name.startswith("/" + needle):
+                items.append(("cmd", name))
+                prompts.append(Option(name))
+        options = self.query_one("#slash-options", OptionList)
+        options.clear_options()
+        if not prompts:
+            self._hide_slash()
+            return
+        self._slash_items = items
+        for prompt in prompts:
+            options.add_option(prompt)
+        options.highlighted = 0
+        options.styles.display = "block"
+        self._slash_visible = True
+
+    def _hide_slash(self) -> None:
+        self._slash_visible = False
+        self._slash_items = []
+        if not self.is_mounted:
+            return
+        self.query_one("#slash-options", OptionList).styles.display = "none"
+
+    def handle_slash_key(self, key: str) -> bool:
+        if not self._slash_visible or not self.is_mounted:
+            return False
+        options = self.query_one("#slash-options", OptionList)
+        if key == "up":
+            options.action_cursor_up()
+            return True
+        if key == "down":
+            options.action_cursor_down()
+            return True
+        if key in ("enter", "tab"):
+            self._activate_slash()
+            return True
+        if key == "escape":
+            self._hide_slash()
+            return True
+        return False
+
+    def _activate_slash(self) -> None:
+        if not self._slash_visible or not self.is_mounted:
+            return
+        options = self.query_one("#slash-options", OptionList)
+        index = options.highlighted
+        if index is None or not (0 <= index < len(self._slash_items)):
+            return
+        kind, payload = self._slash_items[index]
+        if kind == "cmd":
+            self._run_slash(str(payload))
+
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if event.text_area.id != "idea-input":
+            return
+        text = event.text_area.text
+        if text.startswith("/"):
+            self._refresh_slash(text[1:])
+        else:
+            self._hide_slash()
+
+    def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected
+    ) -> None:
+        if event.option_list.id == "slash-options":
+            self._activate_slash()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.input.id == "lang-input":
@@ -353,9 +392,12 @@ class ResultsScreen(Screen):
         app.switch_screen("input")
         if self._result is not None:
             app._input_screen.set_values(self._result.idea)
+        app._input_screen.call_after_refresh(app._input_screen.action_focus_idea)
 
     def action_back(self) -> None:
-        self.app.switch_screen("input")  # type: ignore[attr-defined]
+        app = self.app  # type: ignore[attr-defined]
+        app.switch_screen("input")
+        app._input_screen.call_after_refresh(app._input_screen.action_focus_idea)
 
 
 class ErrorScreen(Screen):
@@ -389,11 +431,122 @@ class ErrorScreen(Screen):
         self.query_one("#error-hint", Static).update(self._hint)
 
     def action_go_back(self) -> None:
-        self.app.switch_screen("input")  # type: ignore[attr-defined]
+        app = self.app  # type: ignore[attr-defined]
+        app.switch_screen("input")
+        app._input_screen.call_after_refresh(app._input_screen.action_focus_idea)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         if event.button.id == "error-back":
             self.action_go_back()
+
+
+class HistoryScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "close", "关闭"),
+        Binding("d", "delete_selected", "删除"),
+    ]
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._option_entries: list[HistoryEntry | None] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="history-card"):
+            yield Static("历史搜索", id="history-title")
+            yield Input(
+                "",
+                id="history-filter",
+                placeholder="输入关键词过滤，回车查看，d 删除，Esc 关闭",
+            )
+            yield OptionList(id="history-options")
+            yield Static(
+                "Tab 切换过滤/列表 · ↑↓ 选择 · 回车查看 · d 删除 · Esc 关闭",
+                id="history-hint",
+            )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.call_after_refresh(self._initial_refresh)
+
+    def _initial_refresh(self) -> None:
+        if not self.is_mounted:
+            return
+        needle = self.query_one("#history-filter", Input).value
+        self._rebuild(needle)
+        self._focus_filter()
+
+    def _focus_filter(self) -> None:
+        if self.is_mounted:
+            self.query_one("#history-filter", Input).focus()
+
+    def _row_label(self, entry: HistoryEntry) -> str:
+        timestamp = entry.timestamp[5:16].replace("T", " ")
+        idea = entry.result.idea
+        if len(idea) > 40:
+            idea = idea[:37] + "…"
+        return f"{timestamp}  {idea}  [{len(entry.result.repositories)}个结果]"
+
+    def _rebuild(self, needle: str) -> None:
+        if not self.is_mounted:
+            return
+        store = self.app._history_store  # type: ignore[attr-defined]
+        entries = [e for e in store.load() if needle in e.result.idea]
+        options = self.query_one("#history-options", OptionList)
+        options.clear_options()
+        self._option_entries = []
+        if not entries:
+            options.add_option(Option("暂无历史搜索记录", disabled=True))
+            self._option_entries = [None]
+        else:
+            for entry in entries:
+                options.add_option(Option(self._row_label(entry)))
+                self._option_entries.append(entry)
+        options.highlighted = 0
+
+    def _selected_entry(self) -> HistoryEntry | None:
+        if not self.is_mounted:
+            return None
+        options = self.query_one("#history-options", OptionList)
+        index = options.highlighted
+        if index is None or not (0 <= index < len(self._option_entries)):
+            return None
+        return self._option_entries[index]
+
+    def _view_selected(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        app = self.app  # type: ignore[attr-defined]
+        app.pop_screen()
+        app._results_screen.set_result(entry.result)
+        app.switch_screen("results")
+
+    def action_close(self) -> None:
+        self.app.pop_screen()  # type: ignore[attr-defined]
+
+    def action_delete_selected(self) -> None:
+        entry = self._selected_entry()
+        if entry is None:
+            return
+        app = self.app  # type: ignore[attr-defined]
+        app._history_store.delete(entry.id)
+        app.notify("已删除该条历史")
+        needle = self.query_one("#history-filter", Input).value
+        self._rebuild(needle)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "history-filter":
+            self._rebuild(event.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "history-filter":
+            self.query_one("#history-options", OptionList).focus()
+
+    def on_option_list_option_selected(
+        self, event: OptionList.OptionSelected
+    ) -> None:
+        if event.option_list.id == "history-options":
+            self._view_selected()
 
 
 class IdeaSearchApp(App):
@@ -419,12 +572,18 @@ class IdeaSearchApp(App):
     #hero-sub { content-align: center middle; color: $text-muted; height: 2; margin-bottom: 1; }
     #input-card { width: 72; max-width: 92%; border: round $accent; background: $panel; padding: 1 2; }
     .field-label { margin-top: 1; color: $text-muted; }
-    #history-label { content-align: center middle; }
     #idea-input { height: 5; margin: 1 0; }
     #lang-input { margin: 1 0; }
     #submit-btn { margin-top: 1; width: 100%; }
+    #slash-options { height: auto; max-height: 8; margin-top: 1; }
     #hint { content-align: center middle; color: $text-muted; height: 2; margin-top: 1; }
-    #history-list { width: 72; max-width: 92%; height: auto; max-height: 10; margin-top: 1; border: round $accent; background: $panel; }
+
+    HistoryScreen { align: center middle; }
+    #history-card { width: 76; max-width: 94%; height: auto; max-height: 90%; border: round $accent; background: $panel; padding: 1 2; }
+    #history-title { content-align: center middle; text-style: bold; color: $accent; height: 2; }
+    #history-filter { margin: 1 0; }
+    #history-options { height: 1fr; max-height: 16; }
+    #history-hint { content-align: center middle; color: $text-muted; height: 2; margin-top: 1; }
 
     #loading-card { width: 72; max-width: 92%; border: round $accent; background: $panel; padding: 1 2; }
     #loading-title { content-align: center middle; color: $accent; text-style: bold; height: 3; }
@@ -460,7 +619,6 @@ class IdeaSearchApp(App):
         self._language_filter = language_filter
         self._history_store = HistoryStore()
         self._input_screen = InputScreen()
-        self._input_screen.set_history(self._history_store.load())
         self._loading_screen = LoadingScreen()
         self._results_screen = ResultsScreen()
         self._error_screen = ErrorScreen()
@@ -480,9 +638,6 @@ class IdeaSearchApp(App):
 
             self._service = SearchService()
         return self._service
-
-    def _refresh_history_input(self) -> None:
-        self._input_screen.set_history(self._history_store.load())
 
     def start_search(self, idea: str, language_filter: str | None = None) -> None:
         self._idea = idea
@@ -517,7 +672,6 @@ class IdeaSearchApp(App):
         self._results_screen.set_result(result)
         try:
             self._history_store.add(result)
-            self._refresh_history_input()
         except Exception as exc:
             self.log.error("failed to persist search history:", exc)
         await self.switch_screen("results")
